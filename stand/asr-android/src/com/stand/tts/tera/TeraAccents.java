@@ -570,6 +570,24 @@ final class TeraAccents {
         LEX.put("яркость", "+яркость");
     }
 
+    /** Отпечаток лексикона: меняется при любой правке ударения, поэтому уже отрендеренный
+     *  звук со старым ударением пересинтезируется, а не берётся из кеша. Только арифметика по
+     *  отсортированным записям: хост и ART должны давать одно значение. */
+    static final String VERSION = fingerprint();
+    private static String fingerprint() {
+        String[] entries = new String[LEX.size()];
+        int i = 0;
+        for (Map.Entry<String, String> e : LEX.entrySet()) entries[i++] = e.getKey() + '=' + e.getValue();
+        java.util.Arrays.sort(entries);
+        long h = 0xcbf29ce484222325L;                       // FNV-1a, 64-bit
+        for (String entry : entries) {
+            for (int j = 0; j < entry.length(); j++) { h ^= entry.charAt(j); h *= 0x100000001b3L; }
+            h ^= '\n'; h *= 0x100000001b3L;
+        }
+        String hex = Long.toHexString(h);
+        return "0000000000000000".substring(hex.length()) + hex;
+    }
+
     private TeraAccents() {
     }
 

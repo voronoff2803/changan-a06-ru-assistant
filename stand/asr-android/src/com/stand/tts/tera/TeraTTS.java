@@ -44,6 +44,8 @@ public class TeraTTS implements AutoCloseable {
      *  records what actually engaged so the caller can log it. */
     public static volatile boolean USE_NNAPI = false;
     public static volatile String PROVIDER_STATUS = "cpu";
+    /** Версия данных ударения: входит в ключ кеша готовой речи (см. TeraTts). */
+    public static final String ACCENT_VERSION = TeraAccents.VERSION;
     public static final int SAMPLE_RATE = 44100;
     private static final int SAMPLES_PER_FRAME = 3072;
     private static final float BASE_SPEED = 1.05f;

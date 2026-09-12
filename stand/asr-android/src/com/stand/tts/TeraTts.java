@@ -34,10 +34,12 @@ public final class TeraTts {
     private static Context appCtx;
     private static final Object LOCK = new Object();
 
-    // Synthesized-PCM cache (key = normalized text + '@' + rate). Fixed greeting phrases are pre-warmed
-    // at init so the first spoken prompt after wake is instant (no synth latency); any repeated phrase
-    // is then served from cache too. Bounded to keep :tts RSS in check.
+    // Rendered speech is cached PER SENTENCE: in memory, and on disk so it survives a restart.
+    // Fixed greetings are still pre-warmed at init, but only until the disk cache has them.
+    // The memory tier is bounded to keep :tts RSS in check.
     private static final int CACHE_MAX = 48;
+    // Disk budget for rendered speech, about four minutes of it.
+    private static final long DISK_CACHE_BYTES = 32L << 20;
     private static final java.util.Map<String, byte[]> CACHE =
             java.util.Collections.synchronizedMap(new java.util.LinkedHashMap<String, byte[]>(64, 0.75f, true) {
                 protected boolean removeEldestEntry(java.util.Map.Entry<String, byte[]> e) { return size() > CACHE_MAX; }
@@ -121,30 +123,123 @@ public final class TeraTts {
 
     /** Synthesize Russian text to mono 16-bit LE PCM at targetRate (resampled from 44100). Empty on failure. */
     public static byte[] synthPcm16(String text, int targetRate) {
+        java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+        for (String sentence : sentences(ttsNormalize(text))) {
+            byte[] pcm = synthSentence(sentence, targetRate);
+            if (pcm.length == 0) return new byte[0];
+            out.write(pcm, 0, pcm.length);
+        }
+        return out.toByteArray();
+    }
+
+    /** One normalized sentence: memory cache -> disk cache -> engine (then cached in both). */
+    private static byte[] synthSentence(String t, int targetRate) {
         try {
-            if (text == null) return new byte[0];
-            String t = ttsNormalize(text);
-            if (t.isEmpty()) return new byte[0];
-            String key = t + "@" + targetRate;
+            if (t.isEmpty() || ctx() == null) return new byte[0];
+            String key = cacheKey(t, targetRate);
             byte[] hit = CACHE.get(key);
-            if (hit != null) { Log.i(TAG, "synthPcm16 cache-hit (" + hit.length + " b): " + t); return hit; }
-            if (ctx() == null || !ensure()) { Log.e(TAG, "synthPcm16: engine not ready"); return new byte[0]; }
+            if (hit == null) hit = readCached(key);
+            if (hit != null) { remember(key, hit); return hit; }
+            if (!ensure()) { Log.e(TAG, "synthSentence: engine not ready"); return new byte[0]; }
             long t0 = System.currentTimeMillis();
             float[] s;
             synchronized (LOCK) { s = engine.synthesize(t, SPEED); }
-            float[] rs = (NATIVE_RATE == targetRate) ? s : resample(s, NATIVE_RATE, targetRate);
-            byte[] pcm = new byte[rs.length * 2];
-            for (int i = 0; i < rs.length; i++) {
-                int v = Math.round(rs[i] * 32767f);
-                if (v > 32767) v = 32767; else if (v < -32768) v = -32768;
-                pcm[i * 2] = (byte) (v & 0xff);
-                pcm[i * 2 + 1] = (byte) ((v >> 8) & 0xff);
-            }
-            Log.i(TAG, "synthPcm16 " + rs.length + " @" + targetRate + " (from " + NATIVE_RATE + ") in "
+            byte[] pcm = pcm16(s, NATIVE_RATE, targetRate);
+            Log.i(TAG, "synth " + pcm.length / 2 + " @" + targetRate + " (from " + NATIVE_RATE + ") in "
                     + (System.currentTimeMillis() - t0) + "ms: " + t);
-            if (pcm.length <= 400000) CACHE.put(key, pcm);   // cache short phrases (~<8s) for instant repeat
+            remember(key, pcm);
+            writeCached(key, pcm);
             return pcm;
-        } catch (Throwable e) { Log.e(TAG, "synthPcm16", e); return new byte[0]; }
+        } catch (Throwable e) { Log.e(TAG, "synthSentence", e); return new byte[0]; }
+    }
+
+    /** Sentence chunks of normalized text. Each is rendered and cached on its own, so a long reply
+     *  starts playing after its first sentence and fixed sentences hit the cache inside variable replies. */
+    private static String[] sentences(String normalized) {
+        java.util.List<String> out = new java.util.ArrayList<String>();
+        if (normalized != null) for (String part : normalized.split("(?<=[.!?…])\\s+")) {
+            if (!part.trim().isEmpty()) out.add(part.trim());
+        }
+        return out.toArray(new String[0]);
+    }
+
+    /** Everything besides the text that changes how a sentence sounds: the lexicon and the dictionary. */
+    private static volatile String accents;
+    private static String accentVersion() {
+        String a = accents;
+        if (a == null) accents = a = com.stand.tts.tera.TeraTTS.ACCENT_VERSION + "." + assetLen(ASSET_DIR + "/ruaccent.bin");
+        return a;
+    }
+
+    /** Stable id of one rendered sentence: text, rate, speed, voice and the stress data. */
+    private static String cacheKey(String sentence, int rate) {
+        try {
+            byte[] d = java.security.MessageDigest.getInstance("SHA-1")
+                    .digest((sentence + "@" + rate + "@" + SPEED + "@" + VOICE + "@" + accentVersion()).getBytes("UTF-8"));
+            StringBuilder sb = new StringBuilder(40);
+            for (byte b : d) sb.append(Character.forDigit((b >> 4) & 15, 16)).append(Character.forDigit(b & 15, 16));
+            return sb.toString();
+        } catch (Exception e) { throw new IllegalStateException(e); }
+    }
+
+    /** Float mono @from -> 16-bit LE PCM @to (linear resample, clipped). */
+    private static byte[] pcm16(float[] s, int from, int to) {
+        float[] rs = (from == to) ? s : resample(s, from, to);
+        byte[] pcm = new byte[rs.length * 2];
+        for (int i = 0; i < rs.length; i++) {
+            int v = Math.round(rs[i] * 32767f);
+            if (v > 32767) v = 32767; else if (v < -32768) v = -32768;
+            pcm[i * 2] = (byte) (v & 0xff);
+            pcm[i * 2 + 1] = (byte) ((v >> 8) & 0xff);
+        }
+        return pcm;
+    }
+
+    private static void remember(String key, byte[] pcm) {
+        if (pcm.length <= 400000) CACHE.put(key, pcm);   // cache short phrases (~<8s) for instant repeat
+    }
+    /** Under models/ so a model swap wipes the rendered speech together with the stale models. */
+    private static File cacheDir() {
+        File dir = new File(appCtx.getFilesDir(), ASSET_DIR + "/models/cache");
+        dir.mkdirs();
+        return dir;
+    }
+    private static byte[] readCached(String key) {
+        try {
+            File f = new File(cacheDir(), key + ".pcm");
+            if (f.isFile()) {
+                f.setLastModified(System.currentTimeMillis());   // a used render survives the next trim
+                return java.nio.file.Files.readAllBytes(f.toPath());
+            }
+        } catch (Throwable ignored) {}
+        return null;
+    }
+    /** The stress data is part of the key, so a lexicon change simply stops matching: those renders
+     *  become unreachable and age out of the budget instead of needing an explicit wipe. */
+    private static void writeCached(String key, byte[] pcm) {
+        try {
+            File dir = cacheDir();
+            java.nio.file.Files.write(new File(dir, key + ".pcm").toPath(), pcm);
+            trimCache(dir, DISK_CACHE_BYTES);
+        } catch (Throwable e) { Log.e(TAG, "cache write", e); }
+    }
+    /** Drop the least recently used renders until the directory fits the budget. */
+    static int trimCache(File dir, long budget) {
+        File[] files = dir == null ? null : dir.listFiles();
+        if (files == null) return 0;
+        long total = 0;
+        for (File f : files) total += f.length();
+        if (total <= budget) return 0;
+        java.util.Arrays.sort(files, new java.util.Comparator<File>() {
+            public int compare(File a, File b) { return Long.compare(a.lastModified(), b.lastModified()); }
+        });
+        int removed = 0;
+        for (File f : files) {
+            if (total <= budget) break;
+            long size = f.length();
+            if (f.delete()) { total -= size; removed++; }
+        }
+        return removed;
     }
 
     private static float[] resample(float[] in, int from, int to) {
@@ -236,30 +331,42 @@ public final class TeraTts {
         if (!canSpeak()) { if (onDone != null) runQuiet(onDone); return; }   // wrong process → skip
         new Thread(new Runnable() { public void run() {
             try {
-                byte[] pcm = synthPcm16(text, RATE);   // ttsNormalize + cache applied inside
-                if (pcm.length == 0) return;
-                playPcm(pcm, RATE);
+                speakStreaming(text);
             } catch (Throwable t) { Log.e(TAG, "speak", t); }
             finally { if (onDone != null) runQuiet(onDone); }
         }}).start();
     }
     private static void runQuiet(Runnable r) { try { r.run(); } catch (Throwable ignored) {} }
 
-    /** Stream 16-bit mono PCM through AudioTrack (blocks ~duration+250 ms). */
-    private static synchronized void playPcm(byte[] pcm, int sr) {
+    /** Play sentence by sentence: the first one starts the track, the rest are synthesized while it
+     *  plays. Synthesis is faster than playback, so the queue stays ahead and the speech is continuous. */
+    private static synchronized void speakStreaming(String text) throws InterruptedException {
+        String[] parts = sentences(ttsNormalize(text));
+        if (parts.length == 0) return;
+        byte[] pcm = synthSentence(parts[0], RATE);
+        if (pcm.length == 0) return;
+        int min = AudioTrack.getMinBufferSize(RATE, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT);
+        AudioTrack at = new AudioTrack(AudioManager.STREAM_MUSIC, RATE,
+                AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT,
+                Math.max(min, RATE * 2 * 20), AudioTrack.MODE_STREAM);   // 20 s: a whole sentence is queued at once
+        track = at;
         try {
-            int min = AudioTrack.getMinBufferSize(sr, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT);
-            AudioTrack at = new AudioTrack(AudioManager.STREAM_MUSIC, sr,
-                    AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT,
-                    Math.max(min, pcm.length), AudioTrack.MODE_STREAM);
-            track = at;
             at.play();
-            at.write(pcm, 0, pcm.length);
-            long ms = (long) (pcm.length / 2 / (double) sr * 1000) + 250;
-            Thread.sleep(ms);
-            at.stop(); at.release();
-            Log.i(TAG, "playback done (" + pcm.length + " b @" + sr + ")");
-        } catch (Throwable t) { Log.e(TAG, "playPcm", t); }
+            long frames = 0;
+            for (int i = 0; i < parts.length; i++) {
+                if (i > 0) pcm = synthSentence(parts[i], RATE);
+                if (pcm.length == 0) break;
+                frames += pcm.length / 2;
+                at.write(pcm, 0, pcm.length);
+            }
+            long deadline = System.currentTimeMillis() + frames * 1000L / RATE + 2000;
+            while ((at.getPlaybackHeadPosition() & 0xffffffffL) < frames
+                    && System.currentTimeMillis() < deadline) Thread.sleep(10);
+            Log.i(TAG, "playback done (" + frames + " frames @" + RATE + ", " + parts.length + " sentence(s))");
+        } finally {
+            try { at.stop(); } catch (Throwable ignored) {}
+            at.release();
+        }
     }
 
     // ---- Text normalization before neural synthesis (moved here from the former PiperTts):
